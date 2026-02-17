@@ -10,13 +10,13 @@ Operational PII (phone numbers, emails, street addresses, URLs, IPs) is **not** 
 ┌──────────────┐     ┌─────────────────────┐     ┌─────────────────┐
 │  OpenClaw GW │────▶│  PII Scrub Proxy    │────▶│  MiniMax API    │
 │  127.0.0.1:  │     │  127.0.0.1:18790    │     │  api.minimax.   │
-│  18789       │     │                     │     │  chat           │
+│  18789       │     │                     │     │  io/anthropic   │
 │              │◀────│  Passes responses   │◀────│                 │
 │              │     │  back untouched     │     │                 │
 └──────────────┘     └─────────────────────┘     └─────────────────┘
 ```
 
-OpenClaw's MiniMax provider `baseURL` is pointed at the proxy instead of the real API. The proxy scrubs outbound request bodies, forwards to MiniMax, and pipes responses back untouched (including SSE streams).
+OpenClaw's MiniMax provider `baseUrl` is pointed at the proxy instead of the real API. The proxy scrubs outbound request bodies (POST to `/v1/messages`), forwards to MiniMax, and pipes responses back untouched (including SSE streams).
 
 ## What gets scrubbed
 
@@ -62,7 +62,7 @@ bash start.sh
 | Variable | Default | Description |
 |---|---|---|
 | `PII_PROXY_PORT` | `18790` | Port the proxy listens on |
-| `MINIMAX_REAL_BASE_URL` | `https://api.minimax.chat` | Upstream MiniMax API base URL |
+| `MINIMAX_REAL_BASE_URL` | `https://api.minimax.io/anthropic` | Upstream MiniMax API base URL |
 
 ### Health check
 
@@ -71,18 +71,39 @@ curl http://127.0.0.1:18790/health
 # {"status":"ok","scrubber":"active"}
 ```
 
-## OpenClaw configuration
+## Deployment on Headless Mac
+
+In production, the proxy runs on a headless Mid-2014 MacBook Pro (macOS Big Sur, Intel) alongside the OpenClaw gateway.
+
+- The proxy runs as the `openclaw` user (low-privilege, no sudo).
+- The OpenClaw gateway is managed by a LaunchDaemon (`system/ai.openclaw.gateway`) on port 18789. The proxy is **not** managed by the LaunchDaemon — it is started separately on port 18790.
+- A future improvement would be adding a second LaunchDaemon or a wrapper script to start the proxy automatically.
+
+### Starting the proxy
+
+```bash
+sudo -u openclaw -i bash /Users/openclaw/openclaw-pii-proxy/start.sh
+```
+
+### OpenClaw configuration
 
 Redirect MiniMax traffic through the proxy:
 
 ```bash
-openclaw config set providers.minimax-portal.baseURL "http://127.0.0.1:18790"
+openclaw config set models.providers.minimax-portal.baseUrl "http://127.0.0.1:18790"
+```
+
+After changing the config, restart the gateway:
+
+```bash
+sudo launchctl kickstart -k system/ai.openclaw.gateway
 ```
 
 Revert to direct MiniMax access:
 
 ```bash
-openclaw config set providers.minimax-portal.baseURL "https://api.minimax.chat"
+openclaw config set models.providers.minimax-portal.baseUrl "https://api.minimax.io/anthropic"
+sudo launchctl kickstart -k system/ai.openclaw.gateway
 ```
 
 ## Tests
@@ -96,5 +117,53 @@ node --test scrubber.test.js
 The proxy logs to stdout with timestamps, HTTP method, path, and scrub count. Message content, headers, and API keys are never logged.
 
 ```
-[2025-02-17T12:00:00Z] POST /v1/chat/completions — scrubbed 3 PII items
+[2025-02-17T12:00:00Z] POST /v1/messages — scrubbed 3 PII items
 ```
+
+## Troubleshooting
+
+### PII still passing through after starting the proxy
+
+**Cause:** OpenClaw's `baseUrl` config wasn't pointed at the proxy, so requests went directly to MiniMax.
+
+**Fix:**
+
+```bash
+openclaw config set models.providers.minimax-portal.baseUrl "http://127.0.0.1:18790"
+sudo launchctl kickstart -k system/ai.openclaw.gateway
+```
+
+**Verify:**
+
+```bash
+openclaw config get models.providers.minimax-portal.baseUrl
+# Should return: http://127.0.0.1:18790
+```
+
+### Gateway won't restart after config change (port 18789 already in use)
+
+**Symptom:** `launchctl kickstart` succeeds but `launchctl print` shows `state = pending` / `job state = exited`. Error log shows "Gateway failed to start: another gateway instance is already listening on ws://127.0.0.1:18789".
+
+**Cause:** A stale gateway process is holding port 18789. `launchctl kickstart -k` sends SIGTERM but the old process doesn't exit cleanly.
+
+**Fix:**
+
+```bash
+# Find the stale PID from the error log
+sudo tail -5 /tmp/openclaw/gateway.err.log
+# Kill it manually
+sudo kill <PID>
+sleep 2
+# Now kickstart works
+sudo launchctl kickstart -k system/ai.openclaw.gateway
+# Verify
+sudo launchctl print system/ai.openclaw.gateway | grep "state"
+# Should show: state = running / job state = running
+```
+
+### Verifying the proxy is actually scrubbing
+
+- Send a test message via WhatsApp containing a known fake SSN (e.g. `123-45-6789`) and credit card (e.g. `4111 1111 1111 1111`).
+- Check proxy stdout for `scrubbed N PII items` log lines.
+- The assistant's response should show `[SSN_REDACTED]` and `[CC_REDACTED]` instead of the raw values.
+- If the assistant echoes back the raw values, the proxy is not in the request path — check the `baseUrl` config.
