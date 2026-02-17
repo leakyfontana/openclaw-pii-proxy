@@ -1,0 +1,11 @@
+{
+  "name": "openclaw-pii-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Outbound PII-scrubbing proxy between OpenClaw and MiniMax M2.5",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node --test scrubber.test.js"
+  }
+}
